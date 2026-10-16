@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Coin Dash</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #cfe9ff; font-family: system-ui, sans-serif; }
+  canvas { display: block; touch-action: none; }
+  #hud { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between;
+         align-items: center; padding: 12px 16px; color: #1c2430; font-weight: 700; pointer-events: none; }
+  #who { display: flex; align-items: center; gap: 10px; background: rgba(255,255,255,.85);
+         padding: 6px 12px; border-radius: 999px; }
+  #face { width: 34px; height: 34px; border-radius: 50%; background: #ddd; object-fit: cover; }
+  .pill { background: rgba(255,255,255,.85); padding: 8px 14px; border-radius: 999px; }
+  #overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+             justify-content: center; text-align: center; background: rgba(20,30,50,.55); color: #fff; padding: 24px; }
+  #overlay h1 { margin: 0 0 8px; font-size: 40px; }
+  #overlay p { margin: 6px 0; font-size: 18px; }
+  #overlay button { margin-top: 16px; font-size: 20px; font-weight: 700; padding: 12px 28px; border: 0;
+                    border-radius: 12px; background: #f7c948; color: #1c2430; cursor: pointer; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div id="who"><img id="face" alt=""><span id="name">Connecting…</span></div>
+  <div class="pill">Coins: <span id="score">0</span></div>
+  <div class="pill">Time: <span id="time">30</span></div>
+</div>
+<div id="overlay">
+  <h1>Coin Dash</h1>
+  <p id="msg">Collect as many coins as you can in 30 seconds.</p>
+  <p>Move with the arrow keys or WASD. On a phone, drag your finger.</p>
+  <p id="best"></p>
+  <button id="play">Play</button>
+</div>
+
+<script type="module">
+import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.min.js';
+
+/* ---------- 1. Talk to start.ng to find out who is playing ---------- */
+const START_NG = 'https://start.ng';
+let framePromise;
+
+function connectFrame() {
+  framePromise ??= new Promise((resolve, reject) => {
+    const el = document.createElement('iframe');
+    el.src = `${START_NG}/connect`;
+    el.hidden = true;
+    el.onload = () => resolve(el);
+    el.onerror = reject;
+    document.body.append(el);
+  });
+  return framePromise;
+}
+
+async function askStartNg(message, replyType, timeoutMs = 3000) {
+  try {
+    const frame = await connectFrame();
+    return await new Promise((resolve) => {
+      const timer = setTimeout(() => { window.removeEventListener('message', onMessage); resolve(null); }, timeoutMs);
+      function onMessage(e) {
+        if (e.origin !== START_NG) return;              // only trust start.ng
+        if (e.data && e.data.type === replyType) {
+          clearTimeout(timer);
+          window.removeEventListener('message', onMessage);
+          resolve(e.data);
+        }
+      }
+      window.addEventListener('message', onMessage);
+      frame.contentWindow.postMessage(message, START_NG);
+    });
+  } catch { return null; }
+}
+
+const DEFAULT_STYLE = {
+  body: 'male', primaryColor: '#2f80ed', secondaryColor: '#1f6f5c', skinColor: '#c68642',
+  hairColor: '#17120f', hair: 'short', hat: 'none', accessory: 'none'
+};
+
+let player = { name: 'Guest', style: DEFAULT_STYLE, face: '' };
+
+async function loadPlayer() {
+  const reply = await askStartNg({ type: 'startng:whoami' }, 'startng:user');
+  const found = reply?.user ?? reply?.guest;           // signed in, or start.ng's guest
+  if (found) {
+    player = {
+      name: found.name || 'Guest',
+      style: { ...DEFAULT_STYLE, ...(found.style || {}) },
+      face: found.face || ''
+    };
+  }
+  document.getElementById('name').textContent = player.name;
+  if (player.face) document.getElementById('face').src = player.face;
+}
+
+/* ---------- 2. Build the character from the player's style ---------- */
+const mat = (color) => new THREE.MeshStandardMaterial({ color, roughness: 0.7 });
+
+function buildCharacter(style) {
+  const g = new THREE.Group();
+  const female = style.body === 'female';
+  const skin = mat(style.skinColor), shirt = mat(style.primaryColor), pants = mat(style.secondaryColor);
+  const hairMat = mat(style.hairColor), gold = mat('#f7c948');
+
+  const legs = [];
+  for (const x of [-0.17, 0.17]) {
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.22, 0.8, 0.26), pants);
+    leg.position.set(x, 0.4, 0);
+    leg.geometry.translate(0, -0.4, 0); leg.position.y = 0.8;  // pivot at the hip
+    g.add(leg); legs.push(leg);
+  }
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(female ? 0.62 : 0.76, 0.85, 0.38), shirt);
+  torso.position.y = 1.22; g.add(torso);
+
+  const arms = [];
+  for (const x of [-1, 1]) {
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.75, 0.2), skin);
+    arm.geometry.translate(0, -0.34, 0);
+    arm.position.set(x * (female ? 0.4 : 0.48), 1.6, 0);
+    g.add(arm); arms.push(arm);
+  }
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.3, 24, 18), skin);
+  head.position.y = 1.95; g.add(head);
+
+  // simple face so you can see which way the character looks
+  for (const x of [-0.1, 0.1]) {
+    const eye = new THREE.Mesh(new THREE.SphereGeometry(0.035, 8, 8), mat('#111111'));
+    eye.position.set(x, 1.99, 0.27); g.add(eye);
+  }
+
+  // hair
+  const hair = String(style.hair || 'short').toLowerCase();
+  if (hair !== 'bald' && hair !== 'none') {
+    const cap = new THREE.Mesh(new THREE.SphereGeometry(0.325, 24, 18, 0, Math.PI * 2, 0, Math.PI * 0.55), hairMat);
+    cap.position.set(0, 1.97, -0.02); g.add(cap);
+    if (hair === 'braids') {
+      for (let i = 0; i < 6; i++) {
+        const braid = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.03, 0.6, 8), hairMat);
+        const a = Math.PI * (0.35 + 0.3 * i) + Math.PI * 0.5;
+        braid.position.set(Math.cos(a) * 0.3, 1.7, Math.sin(a) * 0.3 - 0.08);
+        g.add(braid);
+      }
+    } else if (hair === 'long') {
+      const back = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.7, 0.12), hairMat);
+      back.position.set(0, 1.75, -0.25); g.add(back);
+    }
+  }
+
+  // hat
+  const hat = String(style.hat || 'none').toLowerCase();
+  if (hat === 'crown') {
+    const band = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.3, 0.16, 16), gold);
+    band.position.y = 2.3; g.add(band);
+    for (let i = 0; i < 5; i++) {
+      const spike = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.2, 8), gold);
+      const a = (i / 5) * Math.PI * 2;
+      spike.position.set(Math.cos(a) * 0.23, 2.48, Math.sin(a) * 0.23); g.add(spike);
+    }
+  } else if (hat !== 'none' && hat !== '') {
+    const cap = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.33, 0.18, 16), mat(style.primaryColor));
+    cap.position.y = 2.28; g.add(cap);
+  }
+
+  // accessory
+  const acc = String(style.accessory || 'none').toLowerCase();
+  if (acc === 'earrings') {
+    for (const x of [-0.31, 0.31]) {
+      const ring = new THREE.Mesh(new THREE.SphereGeometry(0.05, 10, 10), gold);
+      ring.position.set(x, 1.86, 0); g.add(ring);
+    }
+  } else if (acc === 'glasses' || acc === 'sunglasses') {
+    const lens = new THREE.Mesh(new THREE.BoxGeometry(0.46, 0.1, 0.05), mat('#111111'));
+    lens.position.set(0, 1.99, 0.28); g.add(lens);
+  }
+
+  g.userData = { legs, arms };
+  return g;
+}
+
+/* ---------- 3. The 3D world ---------- */
+const ARENA = 11;                       // half-size of the play area
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+document.body.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color('#cfe9ff');
+scene.fog = new THREE.Fog('#cfe9ff', 25, 55);
+const camera = new THREE.PerspectiveCamera(55, 1, 0.1, 100);
+
+scene.add(new THREE.HemisphereLight('#ffffff', '#6aa84f', 1.0));
+const sun = new THREE.DirectionalLight('#ffffff', 1.1);
+sun.position.set(8, 14, 6); scene.add(sun);
+
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(ARENA * 2, ARENA * 2), mat('#7ec850'));
+ground.rotation.x = -Math.PI / 2; scene.add(ground);
+const grid = new THREE.GridHelper(ARENA * 2, ARENA, '#5aa63a', '#6fba4a');
+grid.position.y = 0.01; scene.add(grid);
+
+let hero;                               // the character
+const coins = [];
+const coinGeo = new THREE.CylinderGeometry(0.4, 0.4, 0.1, 20);
+const coinMat = new THREE.MeshStandardMaterial({ color: '#ffd23f', emissive: '#c99700', emissiveIntensity: 0.6, metalness: 0, roughness: 0.4 });
+
+function randomSpot() {
+  return new THREE.Vector3((Math.random() * 2 - 1) * (ARENA - 1.5), 0.7, (Math.random() * 2 - 1) * (ARENA - 1.5));
+}
+for (let i = 0; i < 10; i++) {
+  const c = new THREE.Mesh(coinGeo, coinMat);
+  c.rotation.x = Math.PI / 2;
+  c.position.copy(randomSpot());
+  scene.add(c); coins.push(c);
+}
+
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize); resize();
+
+/* ---------- 4. Controls ---------- */
+const keys = {};
+addEventListener('keydown', (e) => { keys[e.key.toLowerCase()] = true; if (e.key === 'Enter' && !playing) startGame(); });
+addEventListener('keyup', (e) => { keys[e.key.toLowerCase()] = false; });
+
+let touchStart = null, touchDir = { x: 0, z: 0 };
+renderer.domElement.addEventListener('pointerdown', (e) => { touchStart = { x: e.clientX, y: e.clientY }; });
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (!touchStart) return;
+  const dx = e.clientX - touchStart.x, dy = e.clientY - touchStart.y;
+  const len = Math.hypot(dx, dy);
+  touchDir = len > 12 ? { x: dx / len, z: dy / len } : { x: 0, z: 0 };
+});
+const endTouch = () => { touchStart = null; touchDir = { x: 0, z: 0 }; };
+addEventListener('pointerup', endTouch); addEventListener('pointercancel', endTouch);
+
+function inputDirection() {
+  let x = 0, z = 0;
+  if (keys['arrowleft'] || keys['a']) x -= 1;
+  if (keys['arrowright'] || keys['d']) x += 1;
+  if (keys['arrowup'] || keys['w']) z -= 1;
+  if (keys['arrowdown'] || keys['s']) z += 1;
+  x += touchDir.x; z += touchDir.z;
+  const len = Math.hypot(x, z);
+  return len > 0 ? { x: x / len, z: z / len } : { x: 0, z: 0 };
+}
+
+/* ---------- 5. Game rules ---------- */
+const ROUND_SECONDS = 30, SPEED = 6.5;
+let playing = false, score = 0, timeLeft = ROUND_SECONDS, best = 0;
+const $ = (id) => document.getElementById(id);
+
+try { best = Number(localStorage.getItem('coin-dash-best') || 0); } catch { best = 0; }
+
+function startGame() {
+  score = 0; timeLeft = ROUND_SECONDS; playing = true;
+  hero.position.set(0, 0, 0);
+  coins.forEach((c) => c.position.copy(randomSpot()));
+  $('score').textContent = 0; $('time').textContent = ROUND_SECONDS;
+  $('overlay').classList.add('hidden');
+}
+
+function endGame() {
+  playing = false;
+  if (score > best) {
+    best = score;
+    try { localStorage.setItem('coin-dash-best', String(best)); } catch { /* ignore */ }
+  }
+  $('msg').textContent = `Time's up, ${player.name}! You collected ${score} coins.`;
+  $('best').textContent = `Your best: ${best}`;
+  $('play').textContent = 'Play again';
+  $('overlay').classList.remove('hidden');
+}
+$('play').addEventListener('click', startGame);
+
+const clock = new THREE.Clock();
+function frame() {
+  requestAnimationFrame(frame);
+  const dt = Math.min(clock.getDelta(), 0.05), t = clock.elapsedTime;
+
+  coins.forEach((c, i) => { c.rotation.z += dt * 3; c.position.y = 0.7 + Math.sin(t * 3 + i) * 0.1; });
+
+  if (hero) {
+    const d = playing ? inputDirection() : { x: 0, z: 0 };
+    hero.position.x = THREE.MathUtils.clamp(hero.position.x + d.x * SPEED * dt, -ARENA + 0.5, ARENA - 0.5);
+    hero.position.z = THREE.MathUtils.clamp(hero.position.z + d.z * SPEED * dt, -ARENA + 0.5, ARENA - 0.5);
+    const moving = d.x !== 0 || d.z !== 0;
+    if (moving) hero.rotation.y = Math.atan2(d.x, d.z);
+    const swing = moving ? Math.sin(t * 12) * 0.7 : 0;
+    const { legs, arms } = hero.userData;
+    legs[0].rotation.x = swing; legs[1].rotation.x = -swing;
+    arms[0].rotation.x = -swing; arms[1].rotation.x = swing;
+
+    if (playing) {
+      for (const c of coins) {
+        if (Math.hypot(c.position.x - hero.position.x, c.position.z - hero.position.z) < 0.9) {
+          score += 1; $('score').textContent = score; c.position.copy(randomSpot());
+        }
+      }
+      timeLeft -= dt; $('time').textContent = Math.max(0, Math.ceil(timeLeft));
+      if (timeLeft <= 0) endGame();
+    }
+    camera.position.lerp(new THREE.Vector3(hero.position.x, 9, hero.position.z + 9), 0.08);
+    camera.lookAt(hero.position.x, 0.8, hero.position.z);
+  }
+  renderer.render(scene, camera);
+}
+
+/* ---------- 6. Go ---------- */
+camera.position.set(0, 9, 9);
+$('play').disabled = true; $('play').textContent = 'Loading your character…';
+await loadPlayer();
+hero = buildCharacter(player.style);
+scene.add(hero);
+$('best').textContent = best ? `Your best: ${best}` : '';
+$('play').disabled = false; $('play').textContent = 'Play';
+frame();
+</script>
+</body>
+</html>
